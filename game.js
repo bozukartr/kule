@@ -26,7 +26,6 @@ const ctx    = canvas.getContext('2d');
 function show(id) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
-  if (id === 'screen-game') setTimeout(resizeCanvas, 60);
 }
 
 function resizeCanvas() {
@@ -151,8 +150,12 @@ function joinQueue() {
         tapHintShown = true;
 
         show('screen-game');
-        initGame();
-        watchOpponent(gameId, oSlot);
+        // Wait for CSS transition so canvas has real dimensions before init
+        setTimeout(() => {
+          resizeCanvas();
+          initGame();
+          watchOpponent(gameId, oSlot);
+        }, 80);
       });
   });
 }
