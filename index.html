@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0d0f1a" />
+  <title>Stack Versus</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;800;900&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <!-- ── MENU ─────────────────────────────────────────── -->
+  <div id="screen-menu" class="screen active">
+    <div class="logo">
+      <span class="logo-stack">STACK</span>
+      <span class="logo-vs">VS</span>
+    </div>
+    <p class="tagline">Place blocks. Outlast your rival.</p>
+    <div class="card">
+      <input id="player-name" type="text" placeholder="Your nickname" maxlength="14" autocomplete="off" />
+      <button id="btn-play" class="btn-primary">FIND MATCH</button>
+    </div>
+  </div>
+
+  <!-- ── QUEUE ────────────────────────────────────────── -->
+  <div id="screen-queue" class="screen">
+    <div class="spinner"></div>
+    <p class="queue-text">Finding opponent…</p>
+    <button id="btn-cancel" class="btn-ghost">Cancel</button>
+  </div>
+
+  <!-- ── GAME ─────────────────────────────────────────── -->
+  <div id="screen-game" class="screen">
+    <div id="hud">
+      <div class="hud-player" id="hud-me">
+        <span class="hud-name" id="my-name">You</span>
+        <span class="hud-score" id="my-score">0</span>
+      </div>
+      <div id="hud-vs">VS</div>
+      <div class="hud-player hud-right" id="hud-opp">
+        <span class="hud-score" id="opp-score">0</span>
+        <span class="hud-name" id="opp-name">Rival</span>
+      </div>
+    </div>
+    <canvas id="game-canvas"></canvas>
+    <div id="tap-hint">TAP TO PLACE</div>
+  </div>
+
+  <!-- ── RESULT ────────────────────────────────────────── -->
+  <div id="screen-result" class="screen">
+    <div id="result-icon"></div>
+    <h2 id="result-title"></h2>
+    <div id="result-scores"></div>
+    <button id="btn-again" class="btn-primary">PLAY AGAIN</button>
+    <button id="btn-menu" class="btn-ghost">Menu</button>
+  </div>
+
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+  <script src="firebase-config.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>
