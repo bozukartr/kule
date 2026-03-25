@@ -3,7 +3,7 @@ const BH     = 34;
 const MIN_W  = 10;
 const COLORS = ['#FF6B6B','#FF922B','#FFD43B','#69DB7C','#4DABF7','#748FFC','#DA77F2','#F783AC','#63E6BE','#FFA94D'];
 
-// ── FIREBASE INIT ──────────────────────────────────────────────────────────
+// ── FIREBASE ───────────────────────────────────────────────────────────────
 firebase.initializeApp(firebaseConfig);
 const db   = firebase.database();
 const auth = firebase.auth();
@@ -12,6 +12,7 @@ const auth = firebase.auth();
 let currentUser = null;
 let myName = '', oppName = '', oppScore = 0;
 let mySlot = '', gameId = '', gRef = null;
+let joinTime = 0;
 
 // ── GAME STATE ─────────────────────────────────────────────────────────────
 let blocks = [], score = 0, gameOver = false, rafId = null;
@@ -57,7 +58,6 @@ function setupMenu(user) {
     myName = user.displayName;
     display.textContent = user.displayName;
     document.getElementById('user-label').textContent = 'Signed in as';
-
     if (user.photoURL) {
       avatar.src    = user.photoURL;
       hudAvatar.src = user.photoURL;
@@ -66,7 +66,6 @@ function setupMenu(user) {
     }
     nickRow.style.display = 'none';
   } else {
-    // Anonymous / guest
     display.textContent = 'Guest';
     document.getElementById('user-label').textContent = 'Playing as';
     avatar.style.display    = 'none';
@@ -83,92 +82,102 @@ document.getElementById('btn-google').onclick = async () => {
     await auth.signInWithPopup(new firebase.auth.GoogleAuthProvider());
   } catch (e) {
     err.textContent = e.code === 'auth/popup-closed-by-user'
-      ? 'Sign-in cancelled.'
-      : 'Sign-in failed. Try again.';
+      ? 'Sign-in cancelled.' : 'Sign-in failed. Try again.';
   }
 };
 
 document.getElementById('btn-anon').onclick = async () => {
   document.getElementById('auth-error').textContent = '';
-  try {
-    await auth.signInAnonymously();
-  } catch (e) {
-    document.getElementById('auth-error').textContent = 'Could not connect. Check your connection.';
-  }
+  try { await auth.signInAnonymously(); }
+  catch (e) { document.getElementById('auth-error').textContent = 'Could not connect.'; }
 };
 
-document.getElementById('btn-signout').onclick = () => {
+document.getElementById('btn-signout').onclick = () => { cleanup(); auth.signOut(); };
+
+// ── MATCHMAKING ─────────────────────────────────────────────────────────────
+// Single /lobby node. Transaction guarantees atomic "create or join".
+// Host (p1) waits for guest. Guest (p2) waits for game node to appear.
+async function findMatch() {
   cleanup();
-  auth.signOut();
-};
+  joinTime = Date.now();
+  const uid = currentUser.uid;
 
-// ── MATCHMAKING ────────────────────────────────────────────────────────────
-function joinQueue() {
-  cleanup(); // clear any lingering listeners from previous session
-
-  const uid      = currentUser.uid;
-  const joinTime = Date.now(); // used to reject stale games
-  const qRef     = db.ref('queue/' + uid);
-  qRef.set({ name: myName, ts: firebase.database.ServerValue.TIMESTAMP });
-  qRef.onDisconnect().remove();
-
-  // Second player creates the game (avoids race conditions)
-  db.ref('queue').on('value', async snap => {
-    const q = snap.val();
-    if (!q) return;
-    const sorted = Object.entries(q).sort((a, b) => a[1].ts - b[1].ts);
-    if (sorted.length < 2 || sorted[1][0] !== uid) return;
-
-    const [uid1, d1] = sorted[0];
-    const [uid2, d2] = sorted[1];
-    const gId = db.ref('games').push().key;
-    await db.ref().update({
-      [`queue/${uid1}`]: null,
-      [`queue/${uid2}`]: null,
-      [`games/${gId}`]: {
-        createdAt: firebase.database.ServerValue.TIMESTAMP,
-        p1: { uid: uid1, name: d1.name, score: 0, lost: false },
-        p2: { uid: uid2, name: d2.name, score: 0, lost: false }
-      }
+  let result;
+  try {
+    result = await db.ref('lobby').transaction(cur => {
+      if (!cur)          return { uid, name: myName };                         // create lobby
+      if (cur.uid === uid) return cur;                                          // already host
+      if (cur.guest)     return undefined;                                      // full → abort
+      return { ...cur, guest: { uid, name: myName } };                        // join as guest
     });
-  });
+  } catch (e) {
+    console.error('Matchmaking error:', e);
+    show('screen-menu');
+    return;
+  }
 
-  // Listen for a game that includes me
-  ['p1', 'p2'].forEach(slot => {
-    db.ref('games').orderByChild(`${slot}/uid`).equalTo(uid)
-      .limitToLast(1).on('child_added', snap => {
-        const g = snap.val();
+  // Lobby full → retry shortly
+  if (!result.committed) { setTimeout(findMatch, 800); return; }
 
-        // Reject stale games: created before I entered the queue (with 10s grace)
-        if (g.createdAt && g.createdAt < joinTime - 10000) return;
+  const lobby = result.snapshot.val();
+  if (!lobby) { setTimeout(findMatch, 500); return; }
 
-        // Guard: don't start twice if both p1/p2 listeners fire
-        if (gameId) return;
+  if (lobby.uid === uid && !lobby.guest) {
+    // ── HOST (p1): lobby created, wait for guest ────────────────────────
+    db.ref('lobby').onDisconnect().set(null);
 
-        db.ref('queue').off();
-        db.ref('queue/' + uid).remove();
+    db.ref('lobby').on('value', async snap => {
+      const l = snap.val();
+      if (!l || l.uid !== uid || !l.guest) return;   // not ready yet
 
-        gameId      = snap.key;
-        mySlot      = slot;
-        const oSlot = slot === 'p1' ? 'p2' : 'p1';
-        oppName     = g[oSlot].name;
-        gRef        = db.ref(`games/${gameId}/${mySlot}`);
+      db.ref('lobby').off();
+      db.ref('lobby').onDisconnect().cancel();
 
-        document.getElementById('my-name').textContent   = myName;
-        document.getElementById('opp-name').textContent  = oppName;
-        document.getElementById('opp-score').textContent = '0';
-        document.getElementById('tap-hint').style.display = 'block';
-        tapHintShown = true;
-
-        show('screen-game');
-        // Wait for CSS transition so canvas has real dimensions before init
-        setTimeout(() => {
-          resizeCanvas();
-          initGame();
-          watchOpponent(gameId, oSlot);
-        }, 80);
+      // Create game node
+      const gId = db.ref('games').push().key;
+      await db.ref().update({
+        lobby: null,
+        [`games/${gId}/createdAt`]: firebase.database.ServerValue.TIMESTAMP,
+        [`games/${gId}/p1`]: { uid, name: myName, score: 0, lost: false },
+        [`games/${gId}/p2`]: { uid: l.guest.uid, name: l.guest.name, score: 0, lost: false }
       });
-  });
+
+      enterGame(gId, 'p1', l.guest.name);
+    });
+
+  } else if (lobby.guest && lobby.guest.uid === uid) {
+    // ── GUEST (p2): lobby joined, wait for host to create game ──────────
+    db.ref('lobby').onDisconnect().set(null);
+
+    db.ref('games').orderByChild('p2/uid').equalTo(uid)
+      .on('child_added', snap => {
+        const g = snap.val();
+        if (!g || (g.createdAt && g.createdAt < joinTime - 20000)) return;
+        if (gameId) return; // guard against double fire
+        enterGame(snap.key, 'p2', g.p1.name);
+      });
+  }
+}
+
+function enterGame(gId, slot, rivalName) {
+  // Detach all matchmaking listeners
+  db.ref('lobby').off();
+  db.ref('lobby').onDisconnect().cancel();
+  db.ref('games').orderByChild('p2/uid').equalTo(currentUser.uid).off();
+
+  gameId  = gId;
+  mySlot  = slot;
+  oppName = rivalName;
+  gRef    = db.ref(`games/${gId}/${slot}`);
+
+  document.getElementById('my-name').textContent   = myName;
+  document.getElementById('opp-name').textContent  = oppName;
+  document.getElementById('opp-score').textContent = '0';
+  document.getElementById('tap-hint').style.display = 'block';
+  tapHintShown = true;
+
+  show('screen-game');
+  setTimeout(() => { resizeCanvas(); initGame(); watchOpponent(gId, slot === 'p1' ? 'p2' : 'p1'); }, 80);
 }
 
 function watchOpponent(gId, oSlot) {
@@ -179,6 +188,20 @@ function watchOpponent(gId, oSlot) {
     document.getElementById('opp-score').textContent = oppScore;
     if (d.lost && !gameOver) endGame(true);
   });
+}
+
+// ── CLEANUP ────────────────────────────────────────────────────────────────
+function cleanup() {
+  db.ref('lobby').off();
+  db.ref('lobby').onDisconnect().cancel();
+  if (currentUser) {
+    db.ref('games').orderByChild('p1/uid').equalTo(currentUser.uid).off();
+    db.ref('games').orderByChild('p2/uid').equalTo(currentUser.uid).off();
+  }
+  if (gameId) {
+    db.ref(`games/${gameId}/${mySlot === 'p1' ? 'p2' : 'p1'}`).off();
+  }
+  gameId = ''; gRef = null;
 }
 
 // ── GAME INIT ──────────────────────────────────────────────────────────────
@@ -196,9 +219,9 @@ function initGame() {
 
 function spawnBlock() {
   const last = blocks[blocks.length - 1];
-  curW   = last.w;
-  curX   = 0;
-  curDir = 1;
+  curW     = last.w;
+  curX     = 0;
+  curDir   = 1;
   curSpeed = Math.min(2.5 + score * 0.09, 8);
 }
 
@@ -208,7 +231,6 @@ function loop() {
   curX += curDir * curSpeed;
   if (curX < 0 || curX + curW > CW) { curDir *= -1; curX += curDir * curSpeed; }
 
-  // Camera: keep moving block near top-third
   const targetCam = Math.max(0, (blocks.length + 1) * BH - CH * 0.7);
   camY += (targetCam - camY) * 0.07;
 
@@ -221,7 +243,6 @@ function draw() {
   ctx.fillStyle = '#0d0f1a';
   ctx.fillRect(0, 0, CW, CH);
 
-  // Edge vignette
   ['left', 'right'].forEach(side => {
     const g = ctx.createLinearGradient(
       side === 'left' ? 0 : CW, 0,
@@ -233,25 +254,20 @@ function draw() {
     ctx.fillRect(side === 'left' ? 0 : CW - 44, 0, 44, CH);
   });
 
-  // Placed blocks
   blocks.forEach((b, i) => {
     const y = CH - (i + 1) * BH - camY;
     if (y > CH + BH || y + BH < -20) return;
     ctx.fillStyle = b.color;
     roundRect(b.x, y, b.w, BH - 3, 6);
-    // shine
     ctx.fillStyle = 'rgba(255,255,255,0.12)';
     roundRect(b.x + 2, y + 2, b.w - 4, 5, 2);
   });
 
-  // Moving block
   const mY = CH - (blocks.length + 1) * BH - camY;
   const ci = blocks.length % COLORS.length;
   ctx.fillStyle = COLORS[ci];
   ctx.globalAlpha = 0.9;
   roundRect(curX, mY, curW, BH - 3, 6);
-
-  // Glow
   ctx.shadowColor = COLORS[ci];
   ctx.shadowBlur  = 20;
   roundRect(curX, mY + BH - 8, curW, 5, 3);
@@ -327,41 +343,29 @@ function showResult(iWon) {
   cleanup();
 }
 
-function cleanup() {
-  db.ref('queue').off();
-  if (currentUser) db.ref('queue/' + currentUser.uid).remove();
-  if (gameId) {
-    db.ref(`games/${gameId}/${mySlot === 'p1' ? 'p2' : 'p1'}`).off();
-  }
-  ['p1', 'p2'].forEach(s => {
-    if (currentUser)
-      db.ref('games').orderByChild(`${s}/uid`).equalTo(currentUser.uid).off();
-  });
-  gameId = ''; gRef = null;
-}
-
 // ── UI EVENTS ──────────────────────────────────────────────────────────────
 document.getElementById('btn-play').onclick = () => {
   const isAnon = !currentUser || currentUser.isAnonymous;
-  if (isAnon) {
-    myName = document.getElementById('player-name').value.trim() || 'Guest';
-  }
-  if (!myName) {
-    document.getElementById('player-name').focus();
-    return;
-  }
+  if (isAnon) myName = document.getElementById('player-name').value.trim() || 'Guest';
+  if (!myName) { document.getElementById('player-name').focus(); return; }
   show('screen-queue');
-  joinQueue();
+  findMatch();
 };
 
-document.getElementById('btn-cancel').onclick = () => {
+document.getElementById('btn-cancel').onclick = async () => {
+  // If we created the lobby, remove it
+  try {
+    const snap = await db.ref('lobby').once('value');
+    const l = snap.val();
+    if (l && l.uid === currentUser?.uid) db.ref('lobby').set(null);
+  } catch {}
   cleanup();
   show('screen-menu');
 };
 
 document.getElementById('btn-again').onclick = () => {
   show('screen-queue');
-  joinQueue();
+  findMatch();
 };
 
 document.getElementById('btn-menu').onclick = () => show('screen-menu');
