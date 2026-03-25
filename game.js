@@ -104,8 +104,11 @@ document.getElementById('btn-signout').onclick = () => {
 
 // ── MATCHMAKING ────────────────────────────────────────────────────────────
 function joinQueue() {
-  const uid  = currentUser.uid;
-  const qRef = db.ref('queue/' + uid);
+  cleanup(); // clear any lingering listeners from previous session
+
+  const uid      = currentUser.uid;
+  const joinTime = Date.now(); // used to reject stale games
+  const qRef     = db.ref('queue/' + uid);
   qRef.set({ name: myName, ts: firebase.database.ServerValue.TIMESTAMP });
   qRef.onDisconnect().remove();
 
@@ -123,6 +126,7 @@ function joinQueue() {
       [`queue/${uid1}`]: null,
       [`queue/${uid2}`]: null,
       [`games/${gId}`]: {
+        createdAt: firebase.database.ServerValue.TIMESTAMP,
         p1: { uid: uid1, name: d1.name, score: 0, lost: false },
         p2: { uid: uid2, name: d2.name, score: 0, lost: false }
       }
@@ -133,18 +137,25 @@ function joinQueue() {
   ['p1', 'p2'].forEach(slot => {
     db.ref('games').orderByChild(`${slot}/uid`).equalTo(uid)
       .limitToLast(1).on('child_added', snap => {
+        const g = snap.val();
+
+        // Reject stale games: created before I entered the queue (with 10s grace)
+        if (g.createdAt && g.createdAt < joinTime - 10000) return;
+
+        // Guard: don't start twice if both p1/p2 listeners fire
+        if (gameId) return;
+
         db.ref('queue').off();
         db.ref('queue/' + uid).remove();
 
-        const g     = snap.val();
         gameId      = snap.key;
         mySlot      = slot;
         const oSlot = slot === 'p1' ? 'p2' : 'p1';
         oppName     = g[oSlot].name;
         gRef        = db.ref(`games/${gameId}/${mySlot}`);
 
-        document.getElementById('my-name').textContent  = myName;
-        document.getElementById('opp-name').textContent = oppName;
+        document.getElementById('my-name').textContent   = myName;
+        document.getElementById('opp-name').textContent  = oppName;
         document.getElementById('opp-score').textContent = '0';
         document.getElementById('tap-hint').style.display = 'block';
         tapHintShown = true;
