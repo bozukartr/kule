@@ -1,23 +1,23 @@
 // ── CONSTANTS ──────────────────────────────────────────────────────────────
-const BH     = 34;       // block height (px)
-const MIN_W  = 10;       // minimum overlap to survive
+const BH     = 34;
+const MIN_W  = 10;
 const COLORS = ['#FF6B6B','#FF922B','#FFD43B','#69DB7C','#4DABF7','#748FFC','#DA77F2','#F783AC','#63E6BE','#FFA94D'];
 
-// ── FIREBASE ───────────────────────────────────────────────────────────────
+// ── FIREBASE INIT ──────────────────────────────────────────────────────────
 firebase.initializeApp(firebaseConfig);
-const db  = firebase.database();
-const UID = Math.random().toString(36).slice(2, 10);
+const db   = firebase.database();
+const auth = firebase.auth();
 
-// ── STATE ──────────────────────────────────────────────────────────────────
+// ── APP STATE ──────────────────────────────────────────────────────────────
+let currentUser = null;
 let myName = '', oppName = '', oppScore = 0;
-let mySlot = '', gameId = '';
-let gRef   = null;   // db ref → games/{id}/{mySlot}
+let mySlot = '', gameId = '', gRef = null;
 
+// ── GAME STATE ─────────────────────────────────────────────────────────────
 let blocks = [], score = 0, gameOver = false, rafId = null;
 let curX = 0, curW = 0, curDir = 1, curSpeed = 2.5;
-let camY = 0, targetCam = 0;
+let camY = 0, tapHintShown = true;
 let CW = 0, CH = 0;
-let tapHintShown = true;
 
 const canvas = document.getElementById('game-canvas');
 const ctx    = canvas.getContext('2d');
@@ -38,18 +38,84 @@ function resizeCanvas() {
   ctx.scale(dpr, dpr);
 }
 
+// ── AUTH ───────────────────────────────────────────────────────────────────
+auth.onAuthStateChanged(user => {
+  currentUser = user;
+  if (!user) { show('screen-auth'); return; }
+  setupMenu(user);
+  show('screen-menu');
+});
+
+function setupMenu(user) {
+  const isGoogle  = user.providerData.some(p => p.providerId === 'google.com');
+  const avatar    = document.getElementById('user-avatar');
+  const hudAvatar = document.getElementById('hud-avatar');
+  const display   = document.getElementById('user-display');
+  const nickRow   = document.getElementById('nickname-row');
+  const nameInput = document.getElementById('player-name');
+
+  if (isGoogle && user.displayName) {
+    myName = user.displayName;
+    display.textContent = user.displayName;
+    document.getElementById('user-label').textContent = 'Signed in as';
+
+    if (user.photoURL) {
+      avatar.src    = user.photoURL;
+      hudAvatar.src = user.photoURL;
+      avatar.style.display    = 'block';
+      hudAvatar.style.display = 'block';
+    }
+    nickRow.style.display = 'none';
+  } else {
+    // Anonymous / guest
+    display.textContent = 'Guest';
+    document.getElementById('user-label').textContent = 'Playing as';
+    avatar.style.display    = 'none';
+    hudAvatar.style.display = 'none';
+    nickRow.style.display   = 'block';
+    myName = nameInput.value.trim() || '';
+  }
+}
+
+document.getElementById('btn-google').onclick = async () => {
+  const err = document.getElementById('auth-error');
+  err.textContent = '';
+  try {
+    await auth.signInWithPopup(new firebase.auth.GoogleAuthProvider());
+  } catch (e) {
+    err.textContent = e.code === 'auth/popup-closed-by-user'
+      ? 'Sign-in cancelled.'
+      : 'Sign-in failed. Try again.';
+  }
+};
+
+document.getElementById('btn-anon').onclick = async () => {
+  document.getElementById('auth-error').textContent = '';
+  try {
+    await auth.signInAnonymously();
+  } catch (e) {
+    document.getElementById('auth-error').textContent = 'Could not connect. Check your connection.';
+  }
+};
+
+document.getElementById('btn-signout').onclick = () => {
+  cleanup();
+  auth.signOut();
+};
+
 // ── MATCHMAKING ────────────────────────────────────────────────────────────
 function joinQueue() {
-  const qRef = db.ref('queue/' + UID);
+  const uid  = currentUser.uid;
+  const qRef = db.ref('queue/' + uid);
   qRef.set({ name: myName, ts: firebase.database.ServerValue.TIMESTAMP });
   qRef.onDisconnect().remove();
 
-  // Second player in queue creates the game
+  // Second player creates the game (avoids race conditions)
   db.ref('queue').on('value', async snap => {
     const q = snap.val();
     if (!q) return;
     const sorted = Object.entries(q).sort((a, b) => a[1].ts - b[1].ts);
-    if (sorted.length < 2 || sorted[1][0] !== UID) return;
+    if (sorted.length < 2 || sorted[1][0] !== uid) return;
 
     const [uid1, d1] = sorted[0];
     const [uid2, d2] = sorted[1];
@@ -64,22 +130,23 @@ function joinQueue() {
     });
   });
 
-  // Listen for a game that includes me (as p1 or p2)
+  // Listen for a game that includes me
   ['p1', 'p2'].forEach(slot => {
-    db.ref('games').orderByChild(`${slot}/uid`).equalTo(UID)
+    db.ref('games').orderByChild(`${slot}/uid`).equalTo(uid)
       .limitToLast(1).on('child_added', snap => {
         db.ref('queue').off();
-        db.ref('queue/' + UID).remove();
+        db.ref('queue/' + uid).remove();
 
-        const g    = snap.val();
-        gameId     = snap.key;
-        mySlot     = slot;
+        const g     = snap.val();
+        gameId      = snap.key;
+        mySlot      = slot;
         const oSlot = slot === 'p1' ? 'p2' : 'p1';
-        oppName    = g[oSlot].name;
-        gRef       = db.ref(`games/${gameId}/${mySlot}`);
+        oppName     = g[oSlot].name;
+        gRef        = db.ref(`games/${gameId}/${mySlot}`);
 
         document.getElementById('my-name').textContent  = myName;
         document.getElementById('opp-name').textContent = oppName;
+        document.getElementById('opp-score').textContent = '0';
         document.getElementById('tap-hint').style.display = 'block';
         tapHintShown = true;
 
@@ -100,9 +167,9 @@ function watchOpponent(gId, oSlot) {
   });
 }
 
-// ── GAME ───────────────────────────────────────────────────────────────────
+// ── GAME INIT ──────────────────────────────────────────────────────────────
 function initGame() {
-  score = 0; blocks = []; camY = 0; targetCam = 0; gameOver = false;
+  score = 0; blocks = []; camY = 0; gameOver = false;
   document.getElementById('my-score').textContent = '0';
 
   const baseW = Math.round(CW * 0.68);
@@ -114,21 +181,21 @@ function initGame() {
 }
 
 function spawnBlock() {
-  const last  = blocks[blocks.length - 1];
-  curW     = last.w;
-  curX     = 0;
-  curDir   = 1;
+  const last = blocks[blocks.length - 1];
+  curW   = last.w;
+  curX   = 0;
+  curDir = 1;
   curSpeed = Math.min(2.5 + score * 0.09, 8);
 }
 
+// ── GAME LOOP ──────────────────────────────────────────────────────────────
 function loop() {
   if (gameOver) return;
-
   curX += curDir * curSpeed;
   if (curX < 0 || curX + curW > CW) { curDir *= -1; curX += curDir * curSpeed; }
 
-  // Camera: keep moving block ~30% from top
-  targetCam = Math.max(0, (blocks.length + 1) * BH - CH * 0.7);
+  // Camera: keep moving block near top-third
+  const targetCam = Math.max(0, (blocks.length + 1) * BH - CH * 0.7);
   camY += (targetCam - camY) * 0.07;
 
   draw();
@@ -137,45 +204,48 @@ function loop() {
 
 // ── DRAW ───────────────────────────────────────────────────────────────────
 function draw() {
-  // bg
   ctx.fillStyle = '#0d0f1a';
   ctx.fillRect(0, 0, CW, CH);
 
-  // shadow wall (left/right edges)
-  const gL = ctx.createLinearGradient(0, 0, 40, 0);
-  gL.addColorStop(0, 'rgba(13,15,26,0.7)'); gL.addColorStop(1, 'transparent');
-  const gR = ctx.createLinearGradient(CW, 0, CW - 40, 0);
-  gR.addColorStop(0, 'rgba(13,15,26,0.7)'); gR.addColorStop(1, 'transparent');
-  ctx.fillStyle = gL; ctx.fillRect(0, 0, 40, CH);
-  ctx.fillStyle = gR; ctx.fillRect(CW - 40, 0, 40, CH);
-
-  // placed blocks
-  blocks.forEach((b, i) => {
-    const y = CH - (i + 1) * BH - camY;
-    if (y > CH || y + BH < -20) return; // skip offscreen
-    ctx.fillStyle = b.color;
-    drawRound(b.x, y, b.w, BH - 3, 6);
-
-    // top shine
-    ctx.fillStyle = 'rgba(255,255,255,0.12)';
-    drawRound(b.x + 2, y + 2, b.w - 4, 6, 3);
+  // Edge vignette
+  ['left', 'right'].forEach(side => {
+    const g = ctx.createLinearGradient(
+      side === 'left' ? 0 : CW, 0,
+      side === 'left' ? 44 : CW - 44, 0
+    );
+    g.addColorStop(0, 'rgba(13,15,26,0.65)');
+    g.addColorStop(1, 'transparent');
+    ctx.fillStyle = g;
+    ctx.fillRect(side === 'left' ? 0 : CW - 44, 0, 44, CH);
   });
 
-  // moving block
-  const mY = CH - (blocks.length + 1) * BH - camY;
-  ctx.fillStyle = COLORS[blocks.length % COLORS.length];
-  ctx.globalAlpha = 0.9;
-  drawRound(curX, mY, curW, BH - 3, 6);
+  // Placed blocks
+  blocks.forEach((b, i) => {
+    const y = CH - (i + 1) * BH - camY;
+    if (y > CH + BH || y + BH < -20) return;
+    ctx.fillStyle = b.color;
+    roundRect(b.x, y, b.w, BH - 3, 6);
+    // shine
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    roundRect(b.x + 2, y + 2, b.w - 4, 5, 2);
+  });
 
-  // glow under moving block
-  ctx.shadowColor = COLORS[blocks.length % COLORS.length];
-  ctx.shadowBlur  = 18;
-  drawRound(curX, mY + BH - 8, curW, 5, 3);
+  // Moving block
+  const mY = CH - (blocks.length + 1) * BH - camY;
+  const ci = blocks.length % COLORS.length;
+  ctx.fillStyle = COLORS[ci];
+  ctx.globalAlpha = 0.9;
+  roundRect(curX, mY, curW, BH - 3, 6);
+
+  // Glow
+  ctx.shadowColor = COLORS[ci];
+  ctx.shadowBlur  = 20;
+  roundRect(curX, mY + BH - 8, curW, 5, 3);
   ctx.shadowBlur  = 0;
   ctx.globalAlpha = 1;
 }
 
-function drawRound(x, y, w, h, r) {
+function roundRect(x, y, w, h, r) {
   if (w < 1) return;
   r = Math.min(r, w / 2, h / 2);
   ctx.beginPath();
@@ -192,7 +262,6 @@ function drawRound(x, y, w, h, r) {
 function onTap() {
   if (gameOver) return;
 
-  // Hide hint after first tap
   if (tapHintShown) {
     document.getElementById('tap-hint').style.display = 'none';
     tapHintShown = false;
@@ -205,21 +274,22 @@ function onTap() {
 
   if (overlap <= MIN_W) { return loseGame(); }
 
-  // Perfect snap (within 5px of perfect alignment)
   const isPerfect = Math.abs(left - last.x) < 5 && Math.abs(right - (last.x + last.w)) < 5;
-  const nx = isPerfect ? last.x : left;
-  const nw = isPerfect ? last.w : overlap;
+  blocks.push({
+    x: isPerfect ? last.x : left,
+    w: isPerfect ? last.w : overlap,
+    color: COLORS[blocks.length % COLORS.length]
+  });
 
-  blocks.push({ x: nx, w: nw, color: COLORS[blocks.length % COLORS.length] });
   score++;
   document.getElementById('my-score').textContent = score;
   gRef && gRef.update({ score, lost: false });
 
   spawnBlock();
-  if (navigator.vibrate) navigator.vibrate(isPerfect ? [10, 30, 10] : 12);
+  if (navigator.vibrate) navigator.vibrate(isPerfect ? [8, 20, 8] : 12);
 }
 
-// ── END ────────────────────────────────────────────────────────────────────
+// ── END GAME ───────────────────────────────────────────────────────────────
 function loseGame() {
   gameOver = true;
   cancelAnimationFrame(rafId);
@@ -245,26 +315,33 @@ function showResult(iWon) {
 
 function cleanup() {
   db.ref('queue').off();
+  if (currentUser) db.ref('queue/' + currentUser.uid).remove();
   if (gameId) {
-    const oSlot = mySlot === 'p1' ? 'p2' : 'p1';
-    db.ref(`games/${gameId}/${oSlot}`).off();
+    db.ref(`games/${gameId}/${mySlot === 'p1' ? 'p2' : 'p1'}`).off();
   }
-  ['p1', 'p2'].forEach(s =>
-    db.ref('games').orderByChild(`${s}/uid`).equalTo(UID).off()
-  );
+  ['p1', 'p2'].forEach(s => {
+    if (currentUser)
+      db.ref('games').orderByChild(`${s}/uid`).equalTo(currentUser.uid).off();
+  });
   gameId = ''; gRef = null;
 }
 
-// ── EVENTS ────────────────────────────────────────────────────────────────
+// ── UI EVENTS ──────────────────────────────────────────────────────────────
 document.getElementById('btn-play').onclick = () => {
-  myName = document.getElementById('player-name').value.trim() || 'Player';
+  const isAnon = !currentUser || currentUser.isAnonymous;
+  if (isAnon) {
+    myName = document.getElementById('player-name').value.trim() || 'Guest';
+  }
+  if (!myName) {
+    document.getElementById('player-name').focus();
+    return;
+  }
   show('screen-queue');
   joinQueue();
 };
 
 document.getElementById('btn-cancel').onclick = () => {
   cleanup();
-  db.ref('queue/' + UID).remove();
   show('screen-menu');
 };
 
